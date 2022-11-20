@@ -28,7 +28,7 @@ def add_ones(x):
 
 # [4x4] homogeneous T from [3x3] R and [3x1] t             
 def poseRt(R, t):
-    print("R={}, t={}".format(R, t))
+    #print("R={}, t={}".format(R, t))
     ret = np.eye(4)
     ret[:3, :3] = R
     ret[:3, 3] = t
@@ -98,10 +98,10 @@ class Viewer3D:
         self.do_follow = True
         self.is_following = True
 
-        self.draw_cameras = True
+        self.draw_cameras = False
 
-        self.checkboxFollow = pangolin.VarBool('ui.Follow', value=True, toggle=True)
-        self.checkboxCam = pangolin.VarBool('ui.Draw Cameras', value=True, toggle=True)
+        self.checkboxFollow = pangolin.VarBool('ui.Follow', value=False, toggle=True)
+        self.checkboxCam = pangolin.VarBool('ui.Draw Cameras', value=False, toggle=True)
         self.checkboxGrid = pangolin.VarBool('ui.Grid', value=True, toggle=True)
         self.checkboxPause = pangolin.VarBool('ui.Pause', value=False, toggle=True)
         self.int_slider = pangolin.VarInt('ui.Point Size', value=self.kDefaultPointSize)
@@ -180,12 +180,13 @@ class Viewer3D:
         # draw vo
         if self.vo_state is not None:
             if self.vo_state.poses.shape[0] >= 2:
-                # draw pose (green)
+                # draw poses (green)
                 if self.draw_cameras:
                     gl.glColor3f(0.0, 1.0, 0.0)
                     pangolin.DrawCameras(self.vo_state.poses[:-1])
             
             if self.vo_state.poses.shape[0] >= 1:
+                # draw current pose (blue)
                 gl.glColor3f(0.0, 0.0, 1.0)
                 current_pose = self.vo_state.poses[-1:]
                 pangolin.DrawCameras(current_pose)
@@ -259,9 +260,7 @@ class PinholeCamera:
         self.u_min, self.u_max = 0, self.width
         self.v_min, self.v_max = 0, self.height
         self.initialized = False
-
         self.init()
-        print("##distorted= {}".format(self.is_distorted))
     
     def init(self):
         if not self.initialized:
@@ -286,12 +285,11 @@ class PinholeCamera:
     def unproject_points(self, uvs):
         return np.dot(self.Kinv, add_ones(uvs).T).T[:, 0:2]
 
-    # undistort 2D points
+    # undistort 2D points using camera distortion parameter
     def undistort_points(self, uvs):
         if self.is_distorted:
             #print("K={} D={}".format(self.K, self.D))
             uvs_contiguous = np.ascontiguousarray(uvs[:, :2]).reshape(uvs.shape[0], 1, 2) # continuous array in memory
-            #print("uvs_contiguous.shape=", uvs_contiguous.shape)
             uvs_undistorted = cv2.undistortPoints(uvs_contiguous, self.K, self.D, None, self.K)
             return uvs_undistorted.ravel().reshape(uvs_undistorted.shape[0], 2)
         else:
@@ -321,7 +319,9 @@ class FeatureDetector:
         self.blockSize = 5
     
     def detect(self, frame, mask=None):
-        pts = cv2.goodFeaturesToTrack(frame, self.num_features, self.quality_level, self.min_corner_distance, blockSize=self.blockSize, mask=mask)
+        pts = cv2.goodFeaturesToTrack(
+            frame, self.num_features, self.quality_level, self.min_corner_distance, blockSize=self.blockSize, mask=mask)
+        # convert matrix of points into list of keypoints
         if pts is not None:
             kps = [cv2.KeyPoint(p[0][0], p[0][1], self.blockSize) for p in pts]
         else:
@@ -329,7 +329,7 @@ class FeatureDetector:
         return kps
 
 class FeatureTracker:
-    def __init__(self, num_features, num_levels = 3, scale_factor = 1.2, ):
+    def __init__(self, num_features, num_levels = 3, scale_factor = 1.2):
         self.min_features = 50
         self.num_features = num_features
         self.feature_detector = FeatureDetector(num_features)
@@ -338,7 +338,7 @@ class FeatureTracker:
                               maxLevel = num_levels, 
                               criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
     
-    def detectAndCompute(self, frame, mask=None):
+    def detect(self, frame, mask=None):
         return self.feature_detector.detect(frame, mask)
 
     def track(self, image_ref, image_cur, kps_ref):
@@ -384,7 +384,7 @@ class VisualOdometry:
 
     def getAbsoluteScale(self, frame_id):
         # if ground truth is there, get current scale
-        return 0.2
+        return 0.5
     
     def computeFundamentalMatrix(self, kps_ref, kps_cur):
         F, mask = cv2.findFundamentalMat(kps_ref, kps_cur, cv2.FM_RANSAC, param1=kRansacThresholdPixels, param2=kRansacProb)
@@ -414,7 +414,7 @@ class VisualOdometry:
     
     def processFirstFrame(self):
         # detect keypoints for current image
-        self.kps_ref = self.feature_tracker.detectAndCompute(self.cur_image)
+        self.kps_ref = self.feature_tracker.detect(self.cur_image)
         # convert from list to keypoints
         self.kps_ref = np.array([x.pt for x in self.kps_ref], dtype=np.float32)
 
@@ -444,7 +444,7 @@ class VisualOdometry:
 
         # check if number of features is enough
         if (self.kps_ref.shape[0] < self.feature_tracker.num_features):
-            self.kps_cur = self.feature_tracker.detectAndCompute(self.cur_image)
+            self.kps_cur = self.feature_tracker.detect(self.cur_image)
             # convert list to keypoints
             self.kps_cur = np.array([x.pt for x in self.kps_cur], dtype=np.float32)
             print("##detected points: {}".format(self.kps_cur.shape[0]))
@@ -538,10 +538,11 @@ class LoadDataset():
 
 
 def main():
+    # Input video path or camera id
+    videopath = "/home/spiral/work/dataset/202207121609.mp4"
+    #videopath = 0 # camera id
 
-    #videopath = "/home/spiral/work/dataset/202207121609.mp4"
-    videopath = 0 # camera id
-
+    # Load dataset
     skip_frame = 240
     dataset = LoadDataset(videopath, skip_frame)
 
@@ -549,14 +550,15 @@ def main():
     K = np.load("./logicool720p/mtx.npy")
     D = np.load("./logicool720p/dist.npy")
 
-    # Camera info
+    # Camera info object
     w = dataset.width
     h = dataset.height
     fps = dataset.fps
     cam = PinholeCamera(w, h, K, D, fps)
 
-    # SHI_TOMASI feature detector
-    # trackertype = FeatureTrackerTypes.LK
+    # initialize detector and tracker:
+    # SHI_TOMASI feature detector and
+    # Optical flow with Lucas-Kanade method
     num_features = 2000
     feature_tracker = FeatureTracker(num_features)
 
@@ -574,14 +576,16 @@ def main():
 
     img_id = 0
     while True:
+        # Load image
         img = dataset.getImage(img_id)
 
         if img is not None:
+            # Process Visual Odometry
             vo.track(img, img_id)
 
+            # Drawing process
             if img_id > 2:
                 x, y, z = vo.traj3d_est[-1]
-                
                 if is_draw_traj_img:
                     draw_x, draw_y = int(draw_scale*x) + half_traj_img_size, half_traj_img_size - int(draw_scale*z)
                     cv2.circle(traj_img, (draw_x, draw_y), 1,(img_id*255/4540, 255-img_id*255/4540, 0), 1)   # estimated from green to blue
@@ -590,14 +594,12 @@ def main():
                     text = "Coordinates: x=%2fm y=%2fm z=%2fm" % (x, y, z)
                     cv2.putText(traj_img, text, (20, 40), cv2.FONT_HERSHEY_PLAIN, 1, (255, 255, 255), 1, 8)
                     cv2.imshow('Trajectory', traj_img)
-
                 if is_draw_3d:
                     viewer3D.draw_vo(vo)
-
             cv2.imshow('Camera', vo.draw_img)
-
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
+
         img_id += 1
 
 if __name__ == '__main__':
