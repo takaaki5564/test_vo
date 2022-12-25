@@ -7,13 +7,10 @@ Main Scripts:
 
 * `test_pangolin.py` is the sample code to detect AR marker and the 3D camera coordinate using Pangolin.
 
---- 
 
-**Requirements**:
+# Dependencies
 
 * Python >3.6.9
 * Numpy >1.18.2
 * OpenCV3
 * [Pangolin](https://github.com/uoip/pangolin)
-
-
