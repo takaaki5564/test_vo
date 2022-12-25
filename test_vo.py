@@ -11,6 +11,7 @@ import time
 import math
 from enum import Enum
 from multiprocessing import Process, Queue, Value
+from slam.utils import *
 
 #import logging
 #logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)7s %(message)s")
@@ -19,215 +20,6 @@ from multiprocessing import Process, Queue, Value
 import OpenGL.GL as gl
 import pangolin
 
-# turn [[x,y]] -> [[x,y,1]]
-def add_ones(x):
-    if len(x.shape) == 1:
-        return add_ones_1D(x)
-    else:
-        return np.concatenate([x, np.ones((x.shape[0], 1))], axis=1)
-
-# [4x4] homogeneous T from [3x3] R and [3x1] t             
-def poseRt(R, t):
-    #print("R={}, t={}".format(R, t))
-    ret = np.eye(4)
-    ret[:3, :3] = R
-    ret[:3, 3] = t
-    return ret   
-
-
-class Viewer3DVoElement(object): 
-    def __init__(self):
-        self.poses = [] 
-        self.traj3d_est = []   # estimated trajectory 
-
-
-class Viewer3D:
-    def __init__(self):
-        self.kUiWidth = 180
-        self.kViewportWidth = 800
-        self.kViewpoerHeight = 800
-        self.kDefaultPointSize = 2
-        
-        self.map_state = None
-        self.qmap = Queue()
-        self.vo_state = None
-        self.qvo = Queue()
-        self._is_running = Value('i', 1)
-        self._is_paused = Value('i', 1)
-        self.vp = Process(target=self.viewer_thread, args=(self.qmap, self.qvo, self._is_running, self._is_paused))
-        self.vp.daemon = True
-        self.vp.start()
-        print("##Viewer3D process thread launghed")
-    
-    def quit(self):
-        self._is_running.value = 0
-        self.vp.join()
-    
-    def is_paused(self):
-        return (self._is_paused.value == 1)
-    
-    def viewer_thread(self, qmap, qvo, is_running, is_paused):
-        print("##Viewer3D thread start")
-        self.viewer_init(self.kViewportWidth, self.kViewpoerHeight)
-        while not pangolin.ShouldQuit() and (is_running.value == 1):
-            self.viewer_refresh(qmap, qvo, is_paused)
-    
-    def viewer_init(self, w, h):
-        print("##start viewer init")
-        pangolin.CreateWindowAndBind('Map Viewer', w, h)
-        gl.glEnable(gl.GL_DEPTH_TEST)
-
-        viewpoint_x = 0
-        viewpoint_y = -40
-        viewpoint_z = -80
-        viewpoint_f = 1000
-        
-        self.proj = pangolin.ProjectionMatrix(w, h, viewpoint_f, viewpoint_f, w/2, h/2, 0.1, 5000)
-        self.look_view = pangolin.ModelViewLookAt(viewpoint_x, viewpoint_y, viewpoint_z, 0, 0, 0, 0, -1, 0)
-        self.scam = pangolin.OpenGlRenderState(self.proj, self.look_view)
-        self.handler = pangolin.Handler3D(self.scam)
-
-        # Create interactive view
-        self.dcam = pangolin.CreateDisplay()
-        self.dcam.SetBounds(0.0, 1.0, self.kUiWidth/w, 1.0, -w/h)
-        self.dcam.SetHandler(pangolin.Handler3D(self.scam))
-
-        self.panel = pangolin.CreatePanel('ui')
-        self.panel.SetBounds(0.0, 1.0, 0.0, self.kUiWidth/w)
-
-        self.do_follow = True
-        self.is_following = True
-
-        self.draw_cameras = False
-
-        self.checkboxFollow = pangolin.VarBool('ui.Follow', value=False, toggle=True)
-        self.checkboxCam = pangolin.VarBool('ui.Draw Cameras', value=False, toggle=True)
-        self.checkboxGrid = pangolin.VarBool('ui.Grid', value=True, toggle=True)
-        self.checkboxPause = pangolin.VarBool('ui.Pause', value=False, toggle=True)
-        self.int_slider = pangolin.VarInt('ui.Point Size', value=self.kDefaultPointSize)
-        
-        self.pointSize = self.int_slider.Get()
-
-        self.Twc = pangolin.OpenGlMatrix()
-        self.Twc.SetIdentity()
-
-    def viewer_refresh(self, qmap, qvo, is_paused):
-        while not qmap.empty():
-            self.map_state = qmap.get()
-        while not qvo.empty():
-            self.vo_state = qvo.get()
-
-        self.do_follow = self.checkboxFollow.Get()
-        self.is_grid = self.checkboxGrid.Get()
-        self.draw_cameras = self.checkboxCam.Get()
-
-        if self.checkboxPause.Get():
-            is_paused.value = 0
-        else:
-            is_paused.value = 1
-        
-        self.pointSize = self.int_slider.Get()
-
-        if self.do_follow and self.is_following:
-            self.scam.Follow(self.Twc, True)
-        elif self.do_follow and not self.is_following:
-            self.scam.SetModelViewMatrix(self.look_view)
-            self.scam.Follow(self.Twc, True)
-            self.is_following = True
-        elif not self.do_follow and self.is_following:
-            self.is_following = True
-        
-        gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
-        gl.glClearColor(1.0, 1.0, 1.0, 1.0)
-        
-        self.dcam.Activate(self.scam)
-
-        if self.is_grid:
-            Viewer3D.drawPlane()
-
-        # ============
-        # draw 3D map
-        if self.map_state is not None:
-            if self.map_state.cur_pose is not None:
-                # draw current pose (blue)
-                gl.glColor3f(0.0, 0.0, 1.0)
-                gl.glLineWidth(2)
-                pangolin.DrawCamera(self.map_state.cur_pose)
-                gl.glLineWidth(1)
-                self.updateTwc(self.map_state.cur_pose)
-        
-            if self.map_state.predicted_pose is not None:
-                gl.glColor3f(1.0, 0.0, 0.0)
-                pangolin.DrawCamera(self.map_state.predicted_pose)
-            
-            if len(self.map_state.poses) > 1:
-                if self.draw_cameras:
-                    gl.glColor3f(0.0, 1.0, 0.0)
-                    pangolin.DrawCameras(self.map_state.poses[:])
-            
-            if len(self.map_state.points) > 0:
-                gl.glPointSize(self.pointSize)
-                pangolin.DrawPoints(self.map_state.points, self.map_state.colors)
-            
-            if self.map_state.reference_pose is not None:
-                gl.glColor3f(0.5, 0.0, 0.5)
-                gl.glLineWidth(2)
-                pangolin.DrawCamera(self.map_state.reference_pose)
-                gl.glLineWidth(1)
-
-
-        # ============
-        # draw vo
-        if self.vo_state is not None:
-            if self.vo_state.poses.shape[0] >= 2:
-                # draw poses (green)
-                if self.draw_cameras:
-                    gl.glColor3f(0.0, 1.0, 0.0)
-                    pangolin.DrawCameras(self.vo_state.poses[:-1])
-            
-            if self.vo_state.poses.shape[0] >= 1:
-                # draw current pose (blue)
-                gl.glColor3f(0.0, 0.0, 1.0)
-                current_pose = self.vo_state.poses[-1:]
-                pangolin.DrawCameras(current_pose)
-                self.updateTwc(current_pose[0])
-            
-            if self.vo_state.traj3d_est.shape[0] != 0:
-                gl.glPointSize(self.pointSize)
-                gl.glColor3f(0.0, 0.0, 1.0)
-                pangolin.DrawLine(self.vo_state.traj3d_est)
-        
-        pangolin.FinishFrame()
-
-
-    def draw_vo(self, vo):
-        if self.qvo is None:
-            return
-        vo_state = Viewer3DVoElement()
-        vo_state.poses = array(vo.poses)
-        vo_state.traj3d_est = array(vo.traj3d_est).reshape(-1, 3)
-
-        self.qvo.put(vo_state)
-    
-    def updateTwc(self, pose):
-        self.Twc.m = pose
-    
-    @staticmethod
-    def drawPlane(num_divs=200, div_size=10):
-        # plane parallel to x-z
-        minx = -num_divs * div_size
-        minz = -num_divs * div_size
-        maxx = num_divs * div_size
-        maxz = num_divs * div_size
-        gl.glColor3f(0.7, 0.7, 0.7)
-        gl.glBegin(gl.GL_LINES)
-
-        for n in range(2 * num_divs):
-            gl.glVertex3f(minx + div_size * n, 0, minz)
-            gl.glVertex3f(minx + div_size * n, 0, maxz)
-            gl.glVertex3f(minx, 0, minz + div_size * n)
-            gl.glVertex3f(maxx, 0, minz + div_size * n)
-        gl.glEnd()
 
 class VoStage(Enum):
     NO_IMAGES_YET = 0       # no image received
@@ -539,8 +331,8 @@ class LoadDataset():
 
 def main():
     # Input video path or camera id
-    videopath = "/home/spiral/work/dataset/202207121609.mp4"
-    #videopath = 0 # camera id
+    #videopath = "/home/spiral/work/dataset/202207121609.mp4"
+    videopath = 4 # camera id
 
     # Load dataset
     skip_frame = 240
