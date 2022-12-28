@@ -24,7 +24,7 @@ from slam.tracking import *
 kMaxIdDistBetweenIntializingFrames = 5
 kFeatureMatchRatioTestInitializer = 0.8
 kRansacProb = 0.999
-kRansacThresholdNormalized = 0.01 #0.0003
+kRansacThresholdNormalized = 0.0003
 kInitializerDesiredMedianDepth = 10
 kInitializerNumMinTriangulatedPoints = 10
 
@@ -139,7 +139,8 @@ class Initializer():
         print("#### [initializer] kf_cur.Tcw,={}".format(kf_cur.Tcw))
 
         # calculate 3D point coordinate of matched feature points
-        pts3d, mask_pts3d = triangulate_normalized_points(kf_cur.Tcw, kf_ref.Tcw, kf_cur.kpsn[idx_cur_inliers], kf_ref.kpsn[idx_ref_inliers])
+        pts3d, mask_pts3d = triangulate_normalized_points(
+            kf_cur.Tcw, kf_ref.Tcw, kf_cur.kpsn[idx_cur_inliers], kf_ref.kpsn[idx_ref_inliers])
 
         new_pts_count, mask_points, _ = map.add_points(pts3d, mask_pts3d, kf_cur, kf_ref, idx_cur_inliers, idx_ref_inliers, img_cur, do_check=True, cos_max_parallax=0.99998)
         print("#### [initializer] triangulate points: ", new_pts_count)

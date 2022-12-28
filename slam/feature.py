@@ -185,7 +185,7 @@ class DescriptorFeatureTracker:
         if frame.ndim > 2:
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
         kps, des = self.feature_descriptor.detectAndCompute(frame, mask)
-        print("####[detectAndCompute] des= {}".format(des))
+        #print("####[detectAndCompute] des= {}".format(des))
         return kps, des
 
     
@@ -214,14 +214,6 @@ class TrackingHistory():
         self.timestamps = []            # list of frame timestamps 
         self.slam_states = []           # list of slam states 
 
-
-
-
-def estimate_pose_ess_mat(kpn_ref, kpn_cur, method=cv2.RANSAC, prob=0.999, threshold=0.0003):	
-    # here, the essential matrix algorithm uses the five-point algorithm solver by D. Nister (see the notes and paper above )     
-    E, mask_match = cv2.findEssentialMat(kpn_cur, kpn_ref, focal=1, pp=(0., 0.), method=method, prob=prob, threshold=threshold)                         
-    _, R, t, mask = cv2.recoverPose(E, kpn_cur, kpn_ref, focal=1, pp=(0., 0.))   
-    return poseRt(R,t.T), mask_match  # Trc, mask_mat         
 
 
 class MotionModel():

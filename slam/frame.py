@@ -544,7 +544,7 @@ class Frame:
                         pts.append(tuple(map(lambda x: int(round(x)), f.kps[idx])))
                         lfid = f.id
                     if len(pts) > 1:
-                        print("#### [Frame] draw matched point traj: {}".format(pts))
+                        #print("#### [Frame] draw matched point traj: {}".format(pts))
                         #cv2.polylines(img, np.array([pts], dtype=np.int32), False, myjet[len(pts)]*255, thickness=1, lineType=16)
                         cv2.polylines(img, np.array([pts], dtype=np.int32), False, (255,255,255), thickness=1, lineType=16)
                     else:
