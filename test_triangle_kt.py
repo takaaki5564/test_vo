@@ -39,7 +39,7 @@ class Draw3D:
 
         self.scam = pangolin.OpenGlRenderState(
             pangolin.ProjectionMatrix(640, 480, 420, 420, 320, 240, 0.2, 1000),
-            pangolin.ModelViewLookAt(-2, 1, -2, 0, 0, 0, pangolin.AxisDirection.AxisY))
+            pangolin.ModelViewLookAt(2, -4, -2, 0, 0, 0, pangolin.AxisDirection.AxisNegY))
         
         self.dcam = pangolin.CreateDisplay()
         self.dcam.SetBounds(0.0, 1.0, 0.0, 1.0, -640/480.0)
@@ -314,7 +314,7 @@ def main():
             if E.shape[0] != 3:
                 E = E[:3, :3]
 
-            # Pose from current frame to previous frame
+            # Pose from curr to prev
             _, Rrc, trc, mask = cv2.recoverPose(E, good_fpn_curr, good_fpn_prev, focal=1, pp=(0.,0.))
 
             if Rrc is None or trc is None:
@@ -322,16 +322,17 @@ def main():
                 continue
             print("# [main] norm trc= {}".format(np.linalg.norm(trc)))
 
-            # Projection from current camera coord to previous camera coord
-            Prc = poseRt(Rrc, trc.T)
-            # Projection from previous camera coord to current camera coord
-            Pcr = inv_T(Prc)
-            # Projection from world coordinate to current camera coord
-            Pcw = Pcr @ Prw
+            # Inv of Projection matrix
+            Mrc = poseRt(Rrc, trc.T)
+            # Projection matrix from prev to curr
+            Mcr = inv_T(Mrc)
+            # Projection matrix from world to curr
+            Pcw = Mcr @ Prw
 
             # Camera pose in world coordinate
-            tcw = tcw + Rcw @ trc
-            Rcw = Rcw @ Rrc
+            Pwc = inv_T(Pcw)
+            Rcw = Pwc[:3, :3]
+            tcw = Pwc[:3, 3].reshape(3,1)
 
             traj_scale = 0.01
             trajectory.append([traj_scale*tcw[0, 0], traj_scale*tcw[1, 0], traj_scale*tcw[2, 0]])
