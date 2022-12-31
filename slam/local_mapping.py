@@ -20,7 +20,32 @@ from slam.feature import *
 from slam.tracking import *
 from slam.initializer import *
 
+kMaxReprojectionDistanceFuse = 3
+kMaxDescriptorDistance = 100
 
+kMinDistanceFromEpipole = 3
+kMinDistanceFromEpipole2 = kMinDistanceFromEpipole*kMinDistanceFromEpipole
+
+def skew(w):
+    wx,wy,wz = w.ravel()    
+    return np.array([[0,-wz,wy],[wz,0,-wx],[-wy,wx,0]])
+
+# compute the fundamental mat F12 and the infinite homography H21 [Hartley Zisserman pag 339]
+def computeF12(f1, f2):
+    R1w = f1.Rcw
+    t1w = f1.tcw 
+    R2w = f2.Rcw
+    t2w = f2.tcw
+
+    R12 = R1w @ R2w.T
+    t12 = -R1w @ (R2w.T @ t2w) + t1w
+    
+    t12x = skew(t12)
+    K1Tinv = f1.camera.Kinv.T
+    R21 = R12.T
+    H21 = (f2.camera.K @ R21) @ f1.camera.Kinv  # infinite homography from f1 to f2 [Hartley Zisserman pag 339]
+    F12 = ( (K1Tinv @ t12x) @ R12 ) @ f2.camera.Kinv
+    return F12, H21  
 
 class LocalMapping(object):
     def __init__(self, map):
@@ -32,7 +57,7 @@ class LocalMapping(object):
         self.kid_last_BA = -1 # last keyframe id when performed BA  
         
         self.queue = []#Queue()
-        self.descriptor_distance_sigma = 0        
+        self.descriptor_distance_sigma = kMaxDescriptorDistance     
         
         self.lock_accept_keyframe = RLock()
         
@@ -53,7 +78,8 @@ class LocalMapping(object):
             print("####[local_mapping] local_map empty, so out")
             return 
                 
-        self.kf_cur = self.queue[-1] #get()   
+        self.kf_cur = self.queue[-1] #get()
+        self.queue.pop(-1)
                 
         self.process_new_keyframe()
 
@@ -63,40 +89,30 @@ class LocalMapping(object):
                 
         # create new points by triangulation 
         total_new_pts = self.create_new_map_points()
-        print("####[local_mapping] new map points: %d " % (total_new_pts))   
+        print("####[local_mapping] created new map points: %d " % (total_new_pts))   
         
-        if len(self.queue) == 0:
-            # fuse map points of close keyframes
-            total_fused_pts = self.fuse_map_points()
-            print("####[local_mapping] fused map points: %d " % (total_fused_pts)) 
+        # fuse map points of close keyframes
+        total_fused_pts = self.fuse_map_points()
+        print("####[local_mapping] fused map points: %d " % (total_fused_pts)) 
 
-            # check redundant local Keyframes
-            #num_culled_keyframes = self.cull_keyframes()
-            #print("####[local_mapping] culled keyframes: %d " % (num_culled_keyframes))    
+        # launch local bundle adjustment 
+        self.local_BA()
 
-        # reset optimization flag 
-        #self.opt_abort_flag.value = False                
-
-        if len(self.queue) == 0:
-
-            # launch local bundle adjustment 
-            self.local_BA()      
-
-            num_culled_keyframes = self.cull_keyframes() 
+        num_culled_keyframes = self.cull_keyframes() 
 
     def local_BA(self):
         # local optimization 
         kNumMinObsForKeyFrameDefault = 3
-        err = self.map.locally_optimize(kf_ref=self.kf_cur, abort_flag=self.opt_abort_flag)
-        print("local optimization error^2:   %f" % err)       
+        err = self.map.locally_optimize(kf_ref=self.kf_cur)
+        print("####[local_BA] local optimization error^2:   %f" % err)       
         num_kf_ref_tracked_points = self.kf_cur.num_tracked_points(kNumMinObsForKeyFrameDefault) # number of tracked points in k_ref
-        print('KF(%d) #points: %d ' %(self.kf_cur.id, num_kf_ref_tracked_points))           
+        print('####[local_BA] KF(%d) #points: %d ' %(self.kf_cur.id, num_kf_ref_tracked_points))           
           
 
     def process_new_keyframe(self):
         # associate map points to keyframe observations (only good points)
         # and update normal and descriptor
-        for idx,p in enumerate(self.kf_cur.get_points()):
+        for idx, p in enumerate(self.kf_cur.get_points()):
             if p is not None and not p.is_bad:  
                 if p.add_observation(self.kf_cur, idx):
                     p.update_info() 
@@ -149,21 +165,18 @@ class LocalMapping(object):
                         for kf_j,idx in p.observations():
                             if kf_j is kf:
                                 continue
-                            assert(not kf_j.is_bad)
+                            #assert(not kf_j.is_bad)
                             scale_level_i = kf_j.octaves[idx]  # scale level of observation in kfi
                             if scale_level_i <= scale_level+1:  # N.B.1 <- more aggressive culling  (expecially when scale_factor=2)
-                            #if scale_level_i <= scale_level:     # N.B.2 <- only same scale or finer                            
                                 p_num_observations +=1
                                 if p_num_observations >= th_num_observations:
                                     break 
                         if p_num_observations >= th_num_observations:
                             kf_num_redundant_observations += 1
-            # if (kf_num_redundant_observations > 0.9 * kf_num_points) and \
-            #    (kf_num_points > 50) and \
-            #    (kf.timestamp - kf.parent.timestamp < 0.5):
-            #     print('####[local_mapping.cull_keyframes] setting keyframe ', kf.id,' bad - redundant observations: ', kf_num_redundant_observations/max(kf_num_points,1),'%')
-            #     kf.set_bad()
-            #     num_culled_keyframes += 1
+            if (kf_num_redundant_observations > 0.9 * kf_num_points) and (kf_num_points > 50):
+                print('####[local_mapping.cull_keyframes] setting keyframe ', kf.id,' bad - redundant observations: ', kf_num_redundant_observations/max(kf_num_points,1),'%')
+                kf.set_bad()
+                num_culled_keyframes += 1
         return num_culled_keyframes
 
 
@@ -172,25 +185,16 @@ class LocalMapping(object):
         kLocalMappingParallelKpsMatching = True
         kLocalMappingParallelKpsMatchingNumWorkers = 4
 
-        if not kLocalMappingParallelKpsMatching: 
-            # do serial computation 
-            for kf in local_keyframes:
-                if kf is self.kf_cur or kf.is_bad:
-                    continue   
-                idxs1, idxs2 = Frame.feature_matcher.match(self.kf_cur.des, kf.des)             
-                match_idxs[(self.kf_cur,kf)]=(idxs1,idxs2)  
-        else: 
-            # do parallell computation 
-            def thread_match_function(kf_pair):
-                kf1,kf2 = kf_pair        
-                idxs1, idxs2 = Frame.feature_matcher.match(kf1.des, kf2.des)             
-                match_idxs[(kf1, kf2)]=(idxs1,idxs2)                   
-            for kf in local_keyframes:
-                if kf is self.kf_cur or kf.is_bad:
-                    continue    
-                kf_pairs.append((self.kf_cur, kf))                       
-            with ThreadPoolExecutor(max_workers = kLocalMappingParallelKpsMatchingNumWorkers) as executor:
-                executor.map(thread_match_function, kf_pairs) # automatic join() at the end of the `width` block 
+        n_match = 0
+        n_bad = 0
+        # do serial computation 
+        for kf in local_keyframes:
+            if kf is self.kf_cur or kf.is_bad:
+                n_bad += 1
+                continue   
+            idxs1, idxs2 = Frame.feature_matcher.match(self.kf_cur.des, kf.des)             
+            match_idxs[(self.kf_cur,kf)]=(idxs1,idxs2)
+            n_match += len(idxs1)
         return match_idxs
             
             
@@ -200,7 +204,7 @@ class LocalMapping(object):
         total_new_pts = 0
         
         local_keyframes = self.map.local_map.get_best_neighbors(self.kf_cur)
-        print('#####[local_mapping.create_new_mp] local map keyframes: ', [kf.id for kf in local_keyframes if not kf.is_bad], ' + ', self.kf_cur.id, '...')            
+        print('#####[local_mapping.create_new_mp] local map keyframes: ', [kf.id for kf in local_keyframes if not kf.is_bad], ' + curr_id(', self.kf_cur.id, ')...')
         
         match_idxs = defaultdict(lambda: (None,None))   # dictionary of matches  (kf_i, kf_j) -> (idxs_i,idxs_j)         
         # precompute keypoint matches 
@@ -210,10 +214,9 @@ class LocalMapping(object):
             if kf is self.kf_cur or kf.is_bad:
                 continue 
             if i>0 and not len(self.queue) == 0:
-                print('#####[local_mapping.create_new_mp] creating new map points *** interruption ***')
+                print('#####[local_mapping.create_new_mp] creating new map points *** interruption *** i= {}, len_queue= {}'.format(i, len(self.queue)))
                 return total_new_pts
-            #print("adding map points for KFs (%d, %d)" % (self.kf_cur.id, kf.id))  
-            
+
             # extract matches from precomputed map  
             idxs_kf_cur, idxs_kf = match_idxs[(self.kf_cur,kf)]
             
@@ -227,7 +230,7 @@ class LocalMapping(object):
                 pts3d, mask_pts3d = triangulate_normalized_points(self.kf_cur.pose, kf.pose, self.kf_cur.kpsn[idxs_cur], kf.kpsn[idxs])
                     
                 new_pts_count,_,list_added_points = self.map.add_points(pts3d, mask_pts3d, self.kf_cur, kf, idxs_cur, idxs, self.kf_cur.img, do_check=True)
-                print("# added map points: %d for KFs (%d, %d)" % (new_pts_count, self.kf_cur.id, kf.id))        
+                print("#####[local_mapping.create_new_mp] added map points: %d for KFs (%d, %d)" % (new_pts_count, self.kf_cur.id, kf.id))        
                 total_new_pts += new_pts_count 
                 self.recently_added_points.update(list_added_points)
         return total_new_pts
@@ -235,29 +238,28 @@ class LocalMapping(object):
         
     # fuse close map points of local keyframes 
     def fuse_map_points(self):
-        print('>>>> fusing map points')
         total_fused_pts = 0
         
         local_keyframes = self.map.local_map.get_best_neighbors(self.kf_cur)
-        print('local map keyframes: ', [kf.id for kf in local_keyframes if not kf.is_bad], ' + ', self.kf_cur.id, '...')   
+        print('#### [fuse_map_points] local map keyframes: ', [kf.id for kf in local_keyframes if not kf.is_bad], ' + ', self.kf_cur.id, '...')   
                 
         # search matches by projection from current KF in close KFs        
         for kf in local_keyframes:
             if kf is self.kf_cur or kf.is_bad:  
                 continue      
-            num_fused_pts = search_and_fuse(self.kf_cur.get_points(), kf,
-                                            max_reproj_distance=Parameters.kMaxReprojectionDistanceFuse,
+            num_fused_pts = self.search_and_fuse(self.kf_cur.get_points(), kf,
+                                            max_reproj_distance=kMaxReprojectionDistanceFuse,
                                             max_descriptor_distance=0.5*self.descriptor_distance_sigma) # finer search
-            print("# fused map points: %d for KFs (%d, %d)" % (num_fused_pts, self.kf_cur.id, kf.id))  
+            #print("# fused map points: %d for KFs (%d, %d)" % (num_fused_pts, self.kf_cur.id, kf.id))  
             total_fused_pts += num_fused_pts    
                
         # search matches by projection from local points in current KF  
         good_local_points = [p for kf in local_keyframes if not kf.is_bad for p in kf.get_points() if (p is not None and not p.is_bad) ]  # all good points in local frames 
         good_local_points = np.array(list(set(good_local_points))) # be sure to get only one instance per point                
-        num_fused_pts = search_and_fuse(good_local_points, self.kf_cur,
-                                        max_reproj_distance=Parameters.kMaxReprojectionDistanceFuse,
+        num_fused_pts = self.search_and_fuse(good_local_points, self.kf_cur,
+                                        max_reproj_distance=kMaxReprojectionDistanceFuse,
                                         max_descriptor_distance=0.5*self.descriptor_distance_sigma) # finer search
-        print("# fused map points: %d for local map into KF %d" % (num_fused_pts, self.kf_cur.id))  
+        print("#### [fuse_map_points] fused map points: %d for local map into KF %d" % (num_fused_pts, self.kf_cur.id))  
         total_fused_pts += num_fused_pts   
             
         # update points info 
@@ -270,66 +272,196 @@ class LocalMapping(object):
         
         return total_fused_pts               
 
-kMaxDescriptorDistance = 100
-def search_frame_for_triangulation(kf1, kf2, idxs1=None, idxs2=None, 
-                                   max_descriptor_distance=0.5*kMaxDescriptorDistance):   
-    idxs2_out = []
-    idxs1_out = []
-    num_found_matches = 0
-    img2_epi = None     
 
-    O1w = kf1.Ow
-    O2w = kf2.Ow
-    # compute epipoles
-    e1,_ = kf1.project_point(O2w)  # in first frame 
-    e2,_ = kf2.project_point(O1w)  # in second frame  
-    
-    baseline = np.linalg.norm(O1w-O2w) 
-
-    medianDepth = kf2.compute_points_median_depth()
-    if medianDepth == -1:
-        print("search for triangulation: f2 with no points")        
-        medianDepth = kf1.compute_points_median_depth()        
-    ratioBaselineDepth = baseline/medianDepth
-    if ratioBaselineDepth < 0.01:
-        print("search for triangulation: impossible with too low ratioBaselineDepth!")
-        return idxs1_out, idxs2_out, num_found_matches, img2_epi # EXIT        
-
-    # compute the fundamental matrix between the two frames by using their estimated poses 
-    F12, H21 = computeF12(kf1, kf2)
-
-    if idxs1 is None or idxs2 is None:
-        timerMatch = Timer()
-        timerMatch.start()        
-        idxs1, idxs2 = Frame.feature_matcher.match(kf1.des, kf2.des)        
-        print('search_frame_for_triangulation - matching - timer: ', timerMatch.elapsed())        
-    
-    rot_histo = RotationHistogram()
-    check_orientation = kCheckFeaturesOrientation and Frame.oriented_features     
-
-    # check epipolar constraints 
-    for i1,i2 in zip(idxs1,idxs2):
-        if kf1.get_point_match(i1) is not None or kf2.get_point_match(i2) is not None: # we are searching for keypoint matches where both keypoints do not have a corresponding map point 
-            continue 
+    # search by projection matches between {input map points} and {unmatched keypoints of frame}
+    def search_and_fuse(self, points, keyframe, 
+                        max_reproj_distance=kMaxReprojectionDistanceFuse,
+                        max_descriptor_distance = 0.5*kMaxDescriptorDistance,
+                        ratio_test=0.8):
         
-        descriptor_dist = Frame.descriptor_distance(kf1.des[i1], kf2.des[i2])
-        if descriptor_dist > max_descriptor_distance:
-            continue     
+        fused_pts_count = 0
+        Ow = keyframe.Ow 
+        if len(points) == 0:
+            print('#### [search_and_fuse] search_and_fuse - no points')        
+            return 
+            
+        # get all matched points of keyframe 
+        good_pts_idxs = np.flatnonzero(points!=None) 
+        good_pts = points[good_pts_idxs] 
         
-        kp1 = kf1.kpsu[i1]
+        if len(good_pts_idxs) == 0:
+            print('#### [search_and_fuse] search_and_fuse - no matched points')
+            return
         
-        kp2 = kf2.kpsu[i2]
-        kp2_scale_factor = Frame.feature_manager.scale_factors[kf2.octaves[i2]]        
-        delta = kp2-e2        
-        if np.inner(delta,delta) < kMinDistanceFromEpipole2 * kp2_scale_factor:   # OR.            
-             continue           
+        # check if points are visible 
+        good_pts_visible, good_projs, good_depths, good_dists = keyframe.are_visible(good_pts)
         
-        # check epipolar constraint         
-        sigma2_kp2 = Frame.feature_manager.level_sigmas2[kf2.octaves[i2]]
-        if check_dist_epipolar_line(kp1,kp2,F12,sigma2_kp2):
-            idxs1_out.append(i1)
-            idxs2_out.append(i2)
+        if len(good_pts_visible) == 0:
+            print('#### [search_and_fuse] search_and_fuse - no visible points')
+            return    
+        
+        predicted_levels = predict_detection_levels(good_pts, good_dists) 
+        kp_scale_factors = Frame.tracker.scale_factors[predicted_levels]              
+        radiuses = max_reproj_distance * kp_scale_factors     
+        kd_idxs = keyframe.kd.query_ball_point(good_projs, radiuses)    
 
-    num_found_matches = len(idxs1_out)
-             
-    return idxs1_out, idxs2_out, num_found_matches, img2_epi
+        for i,p,j in zip(good_pts_idxs,good_pts,range(len(good_pts))):            
+                    
+            if not good_pts_visible[j] or p.is_bad:     # point not visible in frame or point is bad 
+                continue  
+                    
+            if p.is_in_keyframe(keyframe):    # we already matched this map point to this keyframe
+                continue
+                    
+            predicted_level = predicted_levels[j]
+            
+            best_dist = math.inf 
+            best_dist2 = math.inf
+            best_level = -1 
+            best_level2 = -1               
+            best_kd_idx = -1        
+                
+            # find closest keypoints of frame        
+            proj = good_projs[j]
+            for kd_idx in kd_idxs[j]:             
+                    
+                # check detection level     
+                kp_level = keyframe.octaves[kd_idx]    
+                if (kp_level<predicted_level-1) or (kp_level>predicted_level):   
+                    continue
+            
+                # check the reprojection error     
+                kp = keyframe.kpsu[kd_idx]
+                invSigma2 = Frame.tracker.inv_level_sigmas2[kp_level]                
+                err = proj - kp       
+                chi2 = np.inner(err,err)*invSigma2
+                kChi2Mono = 0.5991
+                if chi2 > kChi2Mono: # chi-square 2 DOFs  (Hartley Zisserman pg 119)
+                    continue                  
+                                
+                descriptor_dist = p.min_des_distance(keyframe.des[kd_idx])
+                
+                if descriptor_dist < best_dist:                                      
+                    best_dist2 = best_dist
+                    best_level2 = best_level
+                    best_dist = descriptor_dist
+                    best_level = kp_level
+                    best_kd_idx = kd_idx   
+                else: 
+                    if descriptor_dist < best_dist2:  # N.O.
+                        best_dist2 = descriptor_dist       
+                        best_level2 = kp_level                                   
+
+            if best_dist < max_descriptor_distance:         
+                # apply match distance ratio test only if the best and second are in the same scale level 
+                if (best_level2 == best_level) and (best_dist > best_dist2 * ratio_test):  # N.O.
+                    continue                
+                p_keyframe = keyframe.get_point_match(best_kd_idx)
+                # if there is already a map point replace it otherwise add a new point
+                if p_keyframe is not None:
+                    if not p_keyframe.is_bad:
+                        if p_keyframe.num_observations > p.num_observations:
+                            p.replace_with(p_keyframe)
+                        else:
+                            p_keyframe.replace_with(p)                  
+                else:
+                    p.add_observation(keyframe, best_kd_idx) 
+                fused_pts_count += 1                  
+        return fused_pts_count     
+
+
+    # search keypoint matches (for triangulations) between f1 and f2
+    # search for matches between unmatched keypoints (without a corresponding map point)
+    # in input we have already some pose estimates for f1 and f2
+    kMaxDescriptorDistance = 100
+    def search_frame_for_triangulation(self, kf1, kf2, idxs1=None, idxs2=None, 
+                                    max_descriptor_distance=0.5*kMaxDescriptorDistance):   
+        idxs2_out = []
+        idxs1_out = []
+        num_found_matches = 0
+        img2_epi = None     
+
+        O1w = kf1.Ow
+        O2w = kf2.Ow
+        # compute epipoles
+        e1,_ = kf1.project_point(O2w)  # in first frame 
+        e2,_ = kf2.project_point(O1w)  # in second frame  
+        
+        baseline = np.linalg.norm(O1w-O2w) 
+
+        medianDepth = kf2.compute_points_median_depth()
+        if medianDepth == -1:
+            print("#### [search_frame_for_triangulation] search for triangulation: f2 with no points")        
+            medianDepth = kf1.compute_points_median_depth()        
+        ratioBaselineDepth = baseline/medianDepth
+        if ratioBaselineDepth < 0.01:
+            print("#### [search_frame_for_triangulation] search for triangulation: impossible with too low ratioBaselineDepth!")
+            return idxs1_out, idxs2_out, num_found_matches, img2_epi # EXIT        
+
+        # compute the fundamental matrix between the two frames by using their estimated poses 
+        F12, H21 = computeF12(kf1, kf2)
+
+        if idxs1 is None or idxs2 is None:
+            idxs1, idxs2 = Frame.feature_matcher.match(kf1.des, kf2.des)        
+        print("#### [search_frame_for_triangulation] check match idx1n={} idx2n={}".format(len(idxs1), len(idxs2)))
+
+        rot_histo = RotationHistogram()
+        kCheckFeaturesOrientation = True
+        check_orientation = kCheckFeaturesOrientation
+
+        # check epipolar constraints 
+        mean_desc = 0
+        cnt_mean_desc = 0
+        cnt_none = 0
+        cnt_large_desc = 0
+        cnt_lowinner = 0
+        cnt_checkfalse = 0
+        for i1,i2 in zip(idxs1,idxs2):
+            # we are searching for keypoint matches where both keypoints do not have a corresponding map point 
+            if kf1.get_point_match(i1) is not None or kf2.get_point_match(i2) is not None: 
+                cnt_none += 1
+                continue 
+            
+            descriptor_dist = Frame.descriptor_distance(kf1.des[i1], kf2.des[i2])
+            mean_desc += descriptor_dist
+            cnt_mean_desc += 1
+            if descriptor_dist > max_descriptor_distance:
+                cnt_large_desc += 1
+                continue
+            kp1 = kf1.kpsu[i1]
+            
+            kp2 = kf2.kpsu[i2]
+            kp2_scale_factor = Frame.tracker.scale_factors[kf2.octaves[i2]]        
+            delta = kp2 - e2
+            if np.inner(delta, delta) < kMinDistanceFromEpipole2 * kp2_scale_factor:
+                cnt_lowinner += 1
+                continue
+
+            # check epipolar constraint         
+            sigma2_kp2 = Frame.tracker.level_sigmas2[kf2.octaves[i2]]
+            #print("### check epipolar constraint sigma2_kp2= {}".format(sigma2_kp2))
+            if self.check_dist_epipolar_line(kp1,kp2,F12,sigma2_kp2):
+                idxs1_out.append(i1)
+                idxs2_out.append(i2)
+            else:
+                cnt_checkfalse += 1
+
+        mean_desc /= cnt_mean_desc
+        print("#### [search_frame_for_triangulation] cnt none= {}, large_desc= {}, low_inner= {}, checkfalse= {}".format(cnt_none, cnt_large_desc, cnt_lowinner, cnt_checkfalse))
+        print("#### [search_frame_for_triangulation] desc mean= {:.2f}".format(mean_desc))
+        print("#### [search_frame_for_triangulation] new added map n= {}".format(len(idxs1_out)))
+                
+        return idxs1_out, idxs2_out, num_found_matches, img2_epi
+
+
+    def check_dist_epipolar_line(self, kp1, kp2, F12, sigma2_kp2):
+        # Epipolar line in second image l = kp1' * F12 = [a b c]
+        l = np.dot(F12.T,np.array([kp1[0],kp1[1],1]))
+        num = l[0]*kp2[0] + l[1]*kp2[1] + l[2]  # kp1' * F12 * kp2
+        den = l[0]*l[0] + l[1]*l[1]   # a*a+b*b
+
+        if(den==0):
+            return False
+
+        dist_sqr = num*num/den              # squared (minimum) distance of kp2 from the epipolar line l
+        return dist_sqr < 3.84 * sigma2_kp2 # value of inverse cumulative chi-square for 1 DOF (Hartley Zisserman pag 567)

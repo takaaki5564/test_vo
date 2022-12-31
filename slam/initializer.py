@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 
 import cv2
-from cv2 import aruco
 import numpy as np
 from numpy import array, cross
 from numpy.linalg import solve, norm
@@ -15,17 +14,15 @@ from threading import RLock, Thread
 
 from slam.optimizer import *
 
-from slam.utils import *
-from slam.map import *
-from slam.frame import *
-from slam.feature import *
-from slam.tracking import *
+from slam.utils import triangulate_normalized_points, poseRt, inv_T
+from slam.map import Map, MapPoint
+from slam.frame import Frame, match_frames, KeyFrame
 
 kMaxIdDistBetweenIntializingFrames = 5
 kFeatureMatchRatioTestInitializer = 0.8
 kRansacProb = 0.999
 kRansacThresholdNormalized = 0.0003
-kInitializerDesiredMedianDepth = 10
+kInitializerDesiredMedianDepth = 20
 kInitializerNumMinTriangulatedPoints = 10
 
 class InitializerOutput(object):
@@ -66,9 +63,8 @@ class Initializer():
         self.f_ref = f_cur
         print("#### [initializer] init f_cur pose={}".format(self.f_ref.pose))
 
-    # initialize with two available images    
+    # initialize with two available images
     def initialize(self, f_cur, img_cur):
-        print("#### [initializer] start initialize")
         if self.num_failures > 10:
             self.num_min_triangulated_points = 0.5 * kInitializerNumMinTriangulatedPoints
             self.num_failures = 0
@@ -76,19 +72,12 @@ class Initializer():
         out = InitializerOutput()
         is_ok = False
 
-        print("#### [initializer] initialize1 f_cur pose={}".format(self.f_ref.pose))
         if self.f_ref is not None:
             self.f_ref = self.frames[-1]
             print("#### [initializer] using previous frame as reference")
-            #if f_cur.id - self.f_ref.id > kMaxIdDistBetweenIntializingFrames:
-            #    print("initializer: replaced frames")
-            #    self.f_ref = self.frames[-1]
-            #else:
-            #    print("initializer: max id dist {} is lower than {}".format((f_cur.id - self.f_ref.id), kMaxIdDistBetweenIntializingFrames))
         else:
             print("#### [initializer] f_ref is None")
 
-        print("#### [initializer] initialize2 f_cur pose={}".format(self.f_ref.pose))
         f_ref = self.f_ref
 
         # append current frame
@@ -110,11 +99,11 @@ class Initializer():
         # find keypoint matches        
         idxs_cur, idxs_ref = match_frames(f_cur, f_ref, kFeatureMatchRatioTestInitializer) ### feature point match
         print("#### [initializer] init frames: {}, {}".format(f_cur.id, f_ref.id))
-        #print("#### [initializer] keypoint matched: {}, {}".format(len(idxs_cur), idxs_cur))
+        print("#### [initializer] keypoint matched: {}, {}".format(len(idxs_cur), idxs_cur))
 
+        # estimation pose of f_cur with respect to f_ref
         Trc = self.estimatePose(f_ref.kpsn[idxs_ref], f_cur.kpsn[idxs_cur]) # relative pose of f_cur to f_ref
         Tcr = inv_T(Trc)
-
         f_ref.update_pose(np.eye(4))
         f_cur.update_pose(Tcr)
         print("#### [initializer] set new pose: ref={} cur={}".format(np.eye(4), Tcr))
@@ -135,20 +124,14 @@ class Initializer():
         map.add_keyframe(kf_ref)
         map.add_keyframe(kf_cur)
 
-        print("#### [initializer] kf_ref.Tcw,={}".format(kf_ref.Tcw))
-        print("#### [initializer] kf_cur.Tcw,={}".format(kf_cur.Tcw))
-
         # calculate 3D point coordinate of matched feature points
         pts3d, mask_pts3d = triangulate_normalized_points(
             kf_cur.Tcw, kf_ref.Tcw, kf_cur.kpsn[idx_cur_inliers], kf_ref.kpsn[idx_ref_inliers])
 
         new_pts_count, mask_points, _ = map.add_points(pts3d, mask_pts3d, kf_cur, kf_ref, idx_cur_inliers, idx_ref_inliers, img_cur, do_check=True, cos_max_parallax=0.99998)
-        print("#### [initializer] triangulate points: ", new_pts_count)
+        print("#### [initializer] triangulate points n= ", new_pts_count)
 
-        # new_pts_count, _, _ = self.map.add_points(
-        #     initializer_output.pts, None, kf_cur, kf_ref, initializer_output.idxs_cur, initializer_output.idxs_ref, img, do_check=False)
-
-        if new_pts_count > self.num_min_triangulated_points:
+        if new_pts_count > self.num_min_triangulated_points: # enough number of points
             err = map.optimize(rounds=20, use_robust_kernel=True)
             print("#### [initializer] init optimization error^2: ", err)
 
@@ -161,17 +144,16 @@ class Initializer():
             out.idxs_cur = idx_cur_inliers[mask_points]
             out.kf_ref = kf_ref
             out.idxs_ref = idx_ref_inliers[mask_points]
-            #print("out idx_cur={}".format(out.idxs_cur))
-            #print("out idx_ref={}".format(out.idxs_ref))
 
-            #desired_median_depth = kInitializerDesiredMedianDepth
-            #median_depth = kf_cur.compute_points_median_depth(out.pts)
-            #depth_scale = desired_median_depth / median_depth
-            #print("forcing current median depth {} to {}".format(median_depth, desired_median_depth))
+            # set scene median depth to equal desired_median_depth'
+            desired_median_depth = kInitializerDesiredMedianDepth
+            median_depth = kf_cur.compute_points_median_depth(out.pts)
+            depth_scale = desired_median_depth / median_depth
+            print("#### [initializer] forcing current median depth {} to {}".format(median_depth, desired_median_depth))
 
-            #out.pts[:,:3] = out.pts[:,:3] * depth_scale # scale points
-            #tcw = kf_cur.tcw * depth_scale # scale initial baseline
-            #kf_cur.update_translation(tcw)
+            out.pts[:,:3] = out.pts[:,:3] * depth_scale # scale points
+            tcw = kf_cur.tcw * depth_scale # scale initial baseline
+            kf_cur.update_translation(tcw)
 
         map.delete()
 
@@ -181,7 +163,6 @@ class Initializer():
             self.num_failures += 1
             print("#### [initializer] Initializer: NG !!!!!!!")
         return out, is_ok
- 
 
 
     # initialize with two available images    
@@ -198,11 +179,6 @@ class Initializer():
         if self.f_ref is not None:
             self.f_ref = self.frames[-1]
             print("#### [relocalize] using previous frame as reference")
-            #if f_cur.id - self.f_ref.id > kMaxIdDistBetweenIntializingFrames:
-            #    print("initializer: replaced frames")
-            #    self.f_ref = self.frames[-1]
-            #else:
-            #    print("initializer: max id dist {} is lower than {}".format((f_cur.id - self.f_ref.id), kMaxIdDistBetweenIntializingFrames))
         else:
             print("#### [relocalize] f_ref is None")
 
@@ -233,8 +209,6 @@ class Initializer():
         Trc = self.estimatePose(f_ref.kpsn[idxs_ref], f_cur.kpsn[idxs_cur]) # relative pose of f_cur to f_ref
         Tcr = inv_T(Trc)
 
-        # f_ref.update_pose(np.eye(4))
-        # f_cur.update_pose(Tcr)
         f_ref.update_pose(f_ref.pose.copy())
         f_cur.update_pose(np.dot(f_ref.pose, Tcr))
         print("#### [relocalize] set new pose: ref={} cur={}".format(f_ref.pose, f_cur.pose))
@@ -259,19 +233,10 @@ class Initializer():
         print("#### [relocalize] kf_cur.Tcw,={}".format(kf_cur.Tcw))
 
         # calculate 3D point coordinate of matched feature points
-        #pts3d, mask_pts3d = triangulate_normalized_points(kf_cur.Tcw, kf_ref.Tcw, kf_cur.kpsn[idx_cur_inliers], kf_ref.kpsn[idx_ref_inliers])
-        #pts3d, mask_pts3d = triangulate_normalized_points(kf_cur.Tcw, np.eye(4), kf_cur.kpsn[idx_cur_inliers], kf_ref.kpsn[idx_ref_inliers])
         pts3d, mask_pts3d = triangulate_normalized_points(kf_cur.pose, kf_ref.pose, kf_cur.kpsn[idx_cur_inliers], kf_ref.kpsn[idx_ref_inliers])
 
         new_pts_count, mask_points, _ = map.add_points(pts3d, mask_pts3d, kf_cur, kf_ref, idx_cur_inliers, idx_ref_inliers, img_cur, do_check=True, cos_max_parallax=0.99998)
         print("#### [relocalize] triangulate points: ", new_pts_count)
-
-
-        #pts3d, mask_pts3d = triangulate_normalized_points(self.kf_cur.pose, kf.pose, self.kf_cur.kpsn[idxs_cur], kf.kpsn[idxs])
-        #new_pts_count,_,list_added_points = self.map.add_points(pts3d, mask_pts3d, self.kf_cur, kf, idxs_cur, idxs, self.kf_cur.img, do_check=True)
-
-        # new_pts_count, _, _ = self.map.add_points(
-        #     initializer_output.pts, None, kf_cur, kf_ref, initializer_output.idxs_cur, initializer_output.idxs_ref, img, do_check=False)
 
         if new_pts_count > self.num_min_triangulated_points:
             err = map.optimize(rounds=20, use_robust_kernel=True)
@@ -286,24 +251,22 @@ class Initializer():
             out.idxs_cur = idx_cur_inliers[mask_points]
             out.kf_ref = kf_ref
             out.idxs_ref = idx_ref_inliers[mask_points]
-            #print("out idx_cur={}".format(out.idxs_cur))
-            #print("out idx_ref={}".format(out.idxs_ref))
 
-            #desired_median_depth = kInitializerDesiredMedianDepth
-            #median_depth = kf_cur.compute_points_median_depth(out.pts)
-            #depth_scale = desired_median_depth / median_depth
-            #print("forcing current median depth {} to {}".format(median_depth, desired_median_depth))
+            desired_median_depth = kInitializerDesiredMedianDepth
+            median_depth = kf_cur.compute_points_median_depth(out.pts)
+            depth_scale = desired_median_depth / median_depth
+            print("#### [relocalize] forcing current median depth {} to {}".format(median_depth, desired_median_depth))
 
-            #out.pts[:,:3] = out.pts[:,:3] * depth_scale # scale points
-            #tcw = kf_cur.tcw * depth_scale # scale initial baseline
-            #kf_cur.update_translation(tcw)
+            out.pts[:,:3] = out.pts[:,:3] * depth_scale # scale points
+            tcw = kf_cur.tcw * depth_scale # scale initial baseline
+            kf_cur.update_translation(tcw)
 
         map.delete()
 
         if is_ok:
-            print("#### [initializer] Initializer: OK")
+            print("#### [relocalize] Initializer: OK")
         else:
             self.num_failures += 1
-            print("#### [initializer] Initializer: NG !!!!!!!")
+            print("#### [relocalize] Initializer: NG !!!!!!!")
         return out, is_ok
  

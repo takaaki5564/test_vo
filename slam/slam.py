@@ -13,22 +13,21 @@ from enum import Enum
 from multiprocessing import Process, Queue, Value
 from threading import RLock, Thread
 
-from slam.optimizer import *
+from slam.optimizer import g2o_pose_optimization
 
-from slam.utils import *
-from slam.map import *
-from slam.frame import *
-from slam.feature import *
-from slam.tracking import *
-from slam.initializer import *
-from slam.local_mapping import *
+from slam.utils import poseRt, inv_T
+from slam.map import Map, MapPoint, search_map_by_projection
+from slam.frame import Frame, match_frames, KeyFrame
+from slam.tracking import estimate_pose_ess_mat
+from slam.initializer import Initializer
+from slam.local_mapping import LocalMapping
 
 
-kMaxReprojectionDistanceFrame = 7
+kMaxReprojectionDistanceFrame = 7 # pixels
 kMinNumMatchedFeaturesSearchFrameByProjection = 20
 kNumMinInliersPoseOptimizationTrackFrame = 10
 
-kMaxDescriptorDistance = 50 #100
+kMaxDescriptorDistance = 100
 kMatchRatioTestMap = 0.8
 kUseMotionModel = False
 
@@ -69,8 +68,6 @@ class Tracking():
         
         self.initializer = Initializer()
         
-        self.motion_model = MotionModel() # motion model for current frame pose prediction without damping
-
         self.descriptor_distance_sigma = 100 # for ORB
         self.reproj_err_frame_map_sigma = 3
 
@@ -102,8 +99,6 @@ class Tracking():
         self.local_keyframes = []
         self.local_points = []
 
-        self.tracking_history = TrackingHistory()
-
         self.init_history = True
         self.poses = []
         self.t0_est = None
@@ -128,7 +123,7 @@ class Tracking():
             self.state = SlamState.NOT_INITIALIZED
             return # jumpt to second frame
         
-        if self.state == SlamState.NOT_INITIALIZED or self.state == SlamState.LOST:
+        if self.state == SlamState.NOT_INITIALIZED:# or self.state == SlamState.LOST:
             print("### [slam] try to initialize")
             # initialize frame: estimate pose, calculate 3D map point coordinates
             if self.state == SlamState.NOT_INITIALIZED:
@@ -193,11 +188,13 @@ class Tracking():
             self.track_previous_frame(f_ref, f_cur) # matching
 
             if not self.pose_is_ok:
-                # tracking failed, then track camera motion using kf_ref
+                # tracking failed, then track camera motion using keyframe kf_ref
+                print("###[slam] track prev frame failed, so track keyframe instead")
                 self.track_keyframe(self.kf_ref, f_cur)
             
             if self.pose_is_ok:
                # find matches between local map points and unmatched keypoints of f_cur
+               print("###[slam] tracking ok, so find match with local map")
                self.track_local_map(f_cur)
 
         with self.map.update_lock:
@@ -205,33 +202,30 @@ class Tracking():
                 self.state = SlamState.OK
             else:
                 # if pose estimation failed, set current frame as reference frame for next processing
-                self.initializer.init(f_cur) 
-                self.state = SlamState.LOST
+                #self.initializer.init(f_cur) 
+                #self.state = SlamState.LOST
                 return
 
             if self.pose_is_ok: # tracking was successful
                 f_cur.clean_vo_map_points()
-
-                #need_new_kf = self.need_new_keyframe(f_cur)
-                need_new_kf = True
-
+                # check if new keyframe should be added
+                need_new_kf = self.need_new_keyframe(f_cur)
                 if need_new_kf:
+                    # add new keyframe
                     kf_new = KeyFrame(f_cur, img)
                     self.kf_last = kf_new
                     self.kf_ref = kf_new
                     f_cur.kf_ref = kf_new
-
                     # do local mapping sequentially (not in separate thread)
                     self.local_mapping.push_keyframe(kf_new)
-                    #self.local_mapping.do_local_mapping()
-                
+                    self.local_mapping.do_local_mapping()
                 f_cur.clean_outlier_map_points()
             else:
-                print("###[slam] pose FAILED")
-            
+                print("###[slam] pose estimation FAILED")
+
         if self.f_cur.kf_ref is None:
             self.f_cur.kf_ref = self.kf_ref
-        
+        # updated camera trajectory
         self.update_history()
         print("#[slam.track] map: %d points, %d keyframes" % (self.map.num_points(), self.map.num_keyframes()))
 
@@ -239,11 +233,10 @@ class Tracking():
     # track camera motion of f_cur with reference to f_ref
     def track_previous_frame(self, f_ref, f_cur):
 
-        print("###[slam.track_previous_frame] track previsou frame ")
         is_search_frame_by_projection_failure = False
 
         # search close match map points between f_ref and f_cur by projection
-        print("###[slam.track_previous_frame] search frame by projection")
+        # and return indexes of map points which has smallest descriptor distance
         search_radius = kMaxReprojectionDistanceFrame
         f_cur.reset_points()
         idxs_ref, idxs_cur, num_found_map_pts = self.search_frame_by_projection(f_ref, f_cur,
@@ -266,14 +259,15 @@ class Tracking():
             is_search_frame_by_projection_failure = True
 
         if self.num_matched_kps < kMinNumMatchedFeaturesSearchFrameByProjection:
+            # if not enought map points found, reset map points in current frame
             f_cur.remove_frame_views(idxs_cur)
             f_cur.reset_points()
             is_search_frame_by_projection_failure = True
-            print('###[slam.track_previous_frame] Not enough matches in search frame by projection: ', self.num_matched_kps)
+            print('###[slam.track_previous_frame] Not enough matches: ', self.num_matched_kps)
         else:
             self.idxs_ref = idxs_ref
             self.idxs_cur = idxs_cur
-
+            # remove outlier map points from frame view
             self.pose_optimization(f_cur)
             num_matched_points = f_cur.clean_outlier_map_points()
             print("###[slam.track_previous_frame] num_matced_map_points= {}".format(num_matched_points))
@@ -283,10 +277,11 @@ class Tracking():
                self.pose_is_ok = False       
 
         if is_search_frame_by_projection_failure:
-            print("###[slam.track_previous_frame] track reference frame")
+            # if tracking with previous frame failed, do feature matching and motion estimation between f_cur and f_ref
+            print("###[slam.track_previous_frame] track previous frame failed, so track reference frame")
             self.track_reference_frame(f_ref, f_cur)
 
-
+    # search close match map points between f_ref and f_cur by projection
     def search_frame_by_projection(self, f_ref, f_cur,
                     max_reproj_distance=kMaxReprojectionDistanceFrame,
                     max_descriptor_distance=kMaxDescriptorDistance,
@@ -294,7 +289,6 @@ class Tracking():
         found_pts_count = 0
         idxs_ref = []
         idxs_cur = []
-        print("###[slam.search_frame_by_projection] start search_frame_by_projection")
 
         # get all matched points of f_ref
         matched_ref_idxs = np.flatnonzero((f_ref.points != None) & (f_ref.outliers == False))
@@ -311,36 +305,39 @@ class Tracking():
         projs, depths = f_cur.project_map_points(matched_ref_points)
         # check if 2D projected points are visible
         is_visible = f_cur.are_in_image(projs, depths)
-
+        print("###[slam.search_frame_by_projection] count visible= {} / {}".format((sum(1 for i in is_visible if i == True)), len(is_visible)))
+        # search near points
         kp_ref_octaves = f_ref.octaves[matched_ref_idxs]
         kp_ref_scale_factors = Frame.tracker.scale_factors[kp_ref_octaves]
         radiuses = max_reproj_distance * kp_ref_scale_factors
-        kd_idxs = f_cur.kd.query_ball_point(projs, radiuses)          # search near points
+        # find all points within distance r of point(s) x.
+        kd_idxs = f_cur.kd.query_ball_point(projs, radiuses)
 
+        # get statistics
+        mean_des_dist = 0
+        cnt_des_dist = 0
+
+        # search matched points and add map points which are smallest descriptor distance 
         for i, p, j in zip(matched_ref_idxs, matched_ref_points, range(len(matched_ref_points))):
+            # visible in current frame
             if not is_visible[j]:
-               continue
-            
+               continue            
             kp_ref_octave = f_ref.octaves[i]
-
             best_dist = math.inf
             best_level = -1
             best_k_idx = -1
             best_ref_idx = -1
-            mean_des_dist = 0
-            cnt_des_dist = 0
-
+            # search close points
             for kd_idx in kd_idxs[j]:
                 p_f_cur = f_cur.points[kd_idx]
                 if p_f_cur is not None:
                     # check num of observed keyframes for the map point
                     if p_f_cur.num_observations > 0:
-                        #print("skip 1, ", p_f_cur.num_observations)
+                        # the map point is already registered in the current frame
                         continue
                 # check ovtaves
                 p_f_cur_octave = f_cur.octaves[kd_idx]
                 if p_f_cur_octave < (kp_ref_octave - 1) or p_f_cur_octave > (kp_ref_octave + 1):
-                    #print("skip 2, octave: cur={}, ref={}".format(p_f_cur_octave, kp_ref_octave))
                     continue
                 # check smallest descriptor distance
                 descriptor_dist = p.min_des_distance(f_cur.des[kd_idx])
@@ -356,14 +353,13 @@ class Tracking():
                     found_pts_count += 1
                     idxs_ref.append(best_ref_idx)
                     idxs_cur.append(best_k_idx)
-            # else:
-            #     print("###[slam.search_frame_by_projection] best dist={} > {}".format(best_dist, max_descriptor_distance))
 
-            # if cnt_des_dist != 0:
-            #     print("###[slam.search_frame_by_projection] mean_des_dist= {}".format(mean_des_dist / cnt_des_dist))
-            # else:
-            #     print("###[slam.search_frame_by_projection] matchcnt zero ")
+        if cnt_des_dist != 0:
+            print("###[slam.search_frame_by_projection] mean_des_dist= {} < max= {}".format((mean_des_dist / cnt_des_dist), max_descriptor_distance))
+        else:
+            print("###[slam.search_frame_by_projection] matchcnt zero ")
 
+        print("###[slam.search_frame_by_projection] found good pts count= {} / {}".format(found_pts_count, len(matched_ref_points)))
         return np.array(idxs_ref), np.array(idxs_cur), found_pts_count
 
 
@@ -402,10 +398,11 @@ class Tracking():
     # estimate motion by matching keypoint descriptors                    
     def track_reference_frame(self, f_ref, f_cur, name=''):
 
+        kNumMinInliersPoseOptimizationTrackFrame = 10
         if f_ref is None:
             return 
 
-        # find keypoint matches between f_cur and kf_ref   
+        # find keypoint matches between f_cur and f_ref
         idxs_cur, idxs_ref = match_frames(f_cur, f_ref)
         self.num_matched_kps = idxs_cur.shape[0]
         print("###[slam.track_reference_frame] keypoints matched: %d " % self.num_matched_kps)  
@@ -414,27 +411,27 @@ class Tracking():
         idxs_ref, idxs_cur = self.estimate_pose_by_fitting_ess_mat(f_ref, f_cur, idxs_ref, idxs_cur)      
         print("###[slam.track_reference_frame] matched points after emat est: ref={} cur={}".format(len(idxs_ref), len(idxs_cur)))
                                
-        # propagate map point matches from kf_ref to f_cur  (do not override idxs_ref, idxs_cur)
+        # propagate map point matches from k_ref to f_cur  (do not override idxs_ref, idxs_cur)
         num_found_map_pts_inter_frame, idx_ref_prop, idx_cur_prop, idx_none = self.propagate_map_point_matches(
                         f_ref, f_cur, idxs_ref, idxs_cur, max_descriptor_distance=self.descriptor_distance_sigma) 
         print("###[slam.track_reference_frame] matched map points in prev frame: %d " % num_found_map_pts_inter_frame)
         print("###[slam.track_reference_frame] idxs_ref={} idxs_cur={} -> idx_ref_prop={}, idx_cur_prop={}".format(
             len(idxs_ref), len(idxs_cur), len(idx_ref_prop), len(idx_cur_prop)))
-        #print("###[slam.track_reference_frame] idx_cur_prop={}".format(idx_cur_prop))
                                 
         # store tracking info (for possible reuse)
         self.idxs_ref = idxs_ref
         self.idxs_cur = idxs_cur
 
-        # f_cur pose optimization using last matches with kf_ref:  
+        # f_cur pose optimization using last matches with k_ref:  
         # here, we use first guess of f_cur pose and propated map point matches from f_ref (matched keypoints) 
-        self.pose_optimization(f_cur, name)
+        self.pose_optimization(f_cur)
 
         # update matched map points; discard outliers detected in last pose optimization 
         num_matched_points = f_cur.clean_outlier_map_points()
-
         print('###[slam.track_reference_frame] num_matched_map_points: %d' % (self.num_matched_map_points) ) 
-        if not self.pose_is_ok or self.num_matched_map_points < 10:
+
+        # if not enough matched map points found or pose estimation failed, reset map points in current frame
+        if not self.pose_is_ok or self.num_matched_map_points < kNumMinInliersPoseOptimizationTrackFrame:
             f_cur.remove_frame_views(idxs_cur)
             f_cur.reset_points()
             self.pose_is_ok = False
@@ -472,8 +469,7 @@ class Tracking():
         
         return idxs_ref, idxs_cur
     
-    def pose_optimization(self, f_cur, name=''):
-        print("###[slam.pose_optimization] pose opt start", name)
+    def pose_optimization(self, f_cur):
         pose_before = f_cur.pose.copy()
         pose_opt_error, self.pose_is_ok, self.num_matched_map_points = g2o_pose_optimization(f_cur)
         print("###[slam.pose_optimization] err={}, is_ok={}, num_matched_map_points={}".format(pose_opt_error, self.pose_is_ok, self.num_matched_map_points))
@@ -489,7 +485,6 @@ class Tracking():
     # track camera motion of f_cur w.r.t. given keyframe
     # estimate motion by matching keypoint descriptors                    
     def track_keyframe(self, keyframe, f_cur): 
-        print("####[slam.track_keyframe] start")
         f_cur.update_pose(self.f_ref.pose.copy()) # start pose optimization from last frame pose                    
         self.track_reference_frame(keyframe, f_cur)
 
@@ -536,56 +531,47 @@ class Tracking():
         #print("###[propagate_map_point_matches] idx_none={}".format(idx_none))
         return num_matched_map_pts, idx_ref_out, idx_cur_out, idx_none
 
-
-
-
       
     # track camera motion of f_cur w.r.t. the built local map  
     # find matches between {local map points} (points in the built local map) and {unmatched keypoints of f_cur}   
     def track_local_map(self, f_cur): 
         if self.map.local_map.is_empty():
             return 
-        print('####[slam.track_local_map] tracking local map...')
-
         self.update_local_map()
         
         num_found_map_pts, reproj_err_frame_map_sigma, matched_points_frame_idxs = search_map_by_projection(self.local_points, f_cur,
                                     max_reproj_distance=self.reproj_err_frame_map_sigma, #Parameters.kMaxReprojectionDistanceMap, 
                                     max_descriptor_distance=self.descriptor_distance_sigma) # use the updated local map          
-        #print('reproj_err_sigma: ', reproj_err_frame_map_sigma, ' used: ', self.reproj_err_frame_map_sigma)        
-        print("####[slam.track_local_map] new matched map points in local map: %d " % num_found_map_pts)                   
-        print("####[slam.track_local_map] local map points ", self.map.local_map.num_points())         
+        print("####[slam.track_local_map] found map points in local map n= %d " % num_found_map_pts) 
+        print("####[slam.track_local_map] total local map points n= ", self.map.local_map.num_points())
         
         # f_cur pose optimization 2 with all the matched local map points 
-        self.pose_optimization(f_cur,'proj-map-frame')    
+        self.pose_optimization(f_cur)    
         f_cur.update_map_points_statistics()  # here we do not reset outliers; we let them reach the keyframe generation 
                                               # and then bundle adjustment will possible decide if remove them or not;
                                               # only after keyframe generation the outliers are cleaned!
-        # print('####[slam.track_local_map] num_matched_map_points: %d' % (self.num_matched_map_points) )
         if not self.pose_is_ok:
-            print('####[slam.track_local_map] failure in tracking local map, # matched map points: ', self.num_matched_map_points) 
-            self.pose_is_ok = False                                        
+            print('####[slam.track_local_map] track local map NG!, # matched map points: ', self.num_matched_map_points) 
+            self.pose_is_ok = False
 
     def update_local_map(self):
         self.f_cur.clean_bad_map_points()
         self.kf_ref, self.local_keyframes, self.local_points = self.map.local_map.get_frame_covisibles(self.f_cur)       
         self.f_cur.kf_ref = self.kf_ref  
-        
 
+    # update camera pose (trajctory) with reference to world coordinate
     def update_history(self):
         f_cur = self.map.get_frame(-1)
         self.cur_R = f_cur.pose[:3,:3].T
         self.cur_t = np.dot(-self.cur_R,f_cur.pose[:3,3])
-        #self.cur_R = f_cur._pose.Rcw
-        #self.cur_t = np.dot(-self.cur_R, f_cur._pose.tcw)
-        print("### [slam.update_history] curR={}, curT={}".format(self.cur_R, self.cur_t))
+        #print("### [slam.update_history] curR={}, curT={}".format(self.cur_R, self.cur_t))
         if (self.init_history is True):
             self.t0_est = np.array([self.cur_t[0], self.cur_t[1], self.cur_t[2]])  # starting translation 
-            print("### [slam.update_history] Added t0: {}".format([self.cur_t[0], self.cur_t[1], self.cur_t[2]]))
+            #print("### [slam.update_history] Added t0: {}".format([self.cur_t[0], self.cur_t[1], self.cur_t[2]]))
             self.init_history = False
         if (self.t0_est is not None):
             p = [self.cur_t[0]-self.t0_est[0], self.cur_t[1]-self.t0_est[1], self.cur_t[2]-self.t0_est[2]]   # the estimated traj starts at 0
             self.traj3d_est.append(p)
             self.poses.append(poseRt(self.cur_R, p))
-            print("### [slam.update_history] Added t0: {}".format([self.cur_t[0], self.cur_t[1], self.cur_t[2]]))
+            #print("### [slam.update_history] Added t0: {}".format([self.cur_t[0], self.cur_t[1], self.cur_t[2]]))
 

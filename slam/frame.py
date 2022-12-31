@@ -73,8 +73,6 @@ class CameraPose:
     
     def get_rotation_angle_axis(self):
         angle_axis = g2o.AngleAxis(self._pose.orientation())
-        #angle = angle_axis.angle()
-        #axis = angle_axis.axis()  
         return angle_axis  
     
     def get_inverse_matrix(self):
@@ -83,6 +81,12 @@ class CameraPose:
     def set_from_rotation_and_translation(self, Rcw, tcw): 
         self.set(g2o.Isometry3d(g2o.Quaternion(Rcw), tcw))     
 
+    def set_rotation_matrix(self, Rcw):
+        self.set(g2o.Isometry3d(g2o.Quaternion(Rcw), self._pose.position())) 
+
+    def set_translation(self, tcw):
+        self.set(g2o.Isometry3d(self._pose.orientation(), tcw))
+        
 
 # Frame mainly collects keypoints, descriptors and their corresponding 3D points
 class Frame:
@@ -90,7 +94,6 @@ class Frame:
     _id_lock = RLock()
 
     tracker = None
-    #feature_detector = None
     feature_matcher = None
 
     def __init__(self, img, camera, pose=None, id=None, timestamp=None, kps_data=None):
@@ -228,7 +231,8 @@ class Frame:
    # update pose from transformation matrix 
     def update_translation(self, tcw):
         with self._lock_pose:              
-            self._pose.set_translation(tcw)           
+            self._pose.set_translation(tcw)
+
    # update pose from transformation matrix 
     def update_rotation_and_translation(self, Rcw, tcw):
         with self._lock_pose:          
@@ -244,7 +248,6 @@ class Frame:
         with self._lock_pose:          
             Rcw = self._pose.Rcw
             tcw = self._pose.tcw.reshape((3,1))
-            print("#### [Frame] Rcw={}, tcw={}, points len={}".format(Rcw, tcw, len(points)))       
             return (Rcw @ points.T + tcw).T  # get points  w.r.t. camera frame  [Nx3]      
 
     def num_tracked_points(self, minObs = 1):
@@ -394,7 +397,7 @@ class Frame:
                 return 
             for idx,p in zip(idxs,self.points[idxs]): 
                 if p is not None: 
-                    p.remove_frame_view(self,idx)
+                    p.remove_frame_view(self, idx)
 
     def reset_points(self):
         with self._lock_features:          
@@ -409,9 +412,7 @@ class Frame:
 
     def count_notnone(self): # for debug
         n_notnone = 0
-        if self.points is None:
-            print("#### [Frame] frame points is None")
-        else:
+        if not self.points is None:
             for i, p in enumerate(self.points):
                 if p is not None:
                     n_notnone += 1
@@ -464,7 +465,7 @@ class Frame:
                             num_matched_points +=1
                         else:
                             num_out_observations += 1
-            print("####[clean_outlier_map_points] num_outlier={}/{}, out_frame={}".format(
+            print("####[clean_outlier_map_points] clean outlier n= {}/{}, out_of_frame={}".format(
                 num_outliers, len(self.points), num_out_observations))
             return num_matched_points    
 
@@ -486,8 +487,7 @@ class Frame:
         with self._lock_features:  
             num_replaced_points = 0
             if self.points is not None: 
-                print("#### [frame]: try to replace points n={}".format(len(self.points)))
-                for i,p in enumerate(self.points):      
+                for i, p in enumerate(self.points):      
                     if p is not None: 
                         replacement = p.get_replacement()
                         if replacement is not None: 
@@ -507,6 +507,20 @@ class Frame:
         with self._lock_features:          
             return self.points.copy()    
 
+    def compute_points_median_depth(self, points3d = None):
+        with self._lock_pose:        
+            Rcw2 = self._pose.Rcw[2,:3]  # just 2-nd row 
+            tcw2 = self._pose.tcw[2]   # just 2-nd row                    
+        if points3d is None: 
+            with self._lock_features:                
+                points3d = np.array([p.pt for p in self.points if p is not None])
+        if len(points3d)>0:
+            z = np.dot(Rcw2, points3d[:,:3].T) + tcw2 
+            z = sorted(z) 
+            return z[ ( len(z)-1)//2 ]
+        else:
+            print('[frame]: rframe.compute_points_median_depth() with no points')
+            return -1 
 
     def draw_feature_trails(self, img, kps_idxs, trail_max_length=9):
         img = img.copy()
@@ -577,6 +591,7 @@ class KeyFrameGraph:
         self.parent = None
         self.children = set()
         self.loop_edges = set()
+        self.not_to_erase = False   # if there is a loop edge then you cannot erase this keyframe 
         self.connected_keyframes_weights = Counter()
         self.ordered_keyframes_weights = OrderedDict()
         self.is_first_connection = True
@@ -613,7 +628,29 @@ class KeyFrameGraph:
     def has_child(self, keyframe):            
         with self._lock_connections:
             return keyframe in self.children        
-        
+
+    # covisibility graph
+    def reset_covisibility(self): 
+        self.connected_keyframes_weights = Counter() 
+        self.ordered_keyframes_weights = OrderedDict()    
+
+    def add_connection(self, keyframe, weigth):
+        with self._lock_connections: 
+            self.connected_keyframes_weights[keyframe]=weigth
+            self.update_best_covisibles()
+            
+    def erase_connection(self, keyframe):
+        with self._lock_connections: 
+            try:
+                del self.connected_keyframes_weights[keyframe]   
+                self.update_best_covisibles()
+            except: 
+                pass 
+
+    def get_weight(self,keyframe): 
+        with self._lock_connections:  
+            return self.connected_keyframes_weights[keyframe]  
+
     # Loop edge
     def add_loop_edge(self, keyframe):
         with self._lock_connections:
@@ -648,6 +685,7 @@ class KeyFrameGraph:
 class KeyFrame(Frame, KeyFrameGraph):
     def __init__(self, frame, img=None):
         KeyFrameGraph.__init__(self)
+        print("frame.pose= {}".format(frame.pose))
         Frame.__init__(self, img=None, camera=frame.camera, pose=frame.pose, id=frame.id)
         print("##[KeyFrame class] init id={}".format(self.id))
 
@@ -733,8 +771,70 @@ class KeyFrame(Frame, KeyFrameGraph):
             if self.is_first_connection and self.kid!=0: 
                 self.set_parent(kf_max)
                 self.is_first_connection = False 
-        #print('ordered_keyframes_weights: ', self.ordered_keyframes_weights)                               
+
+
+    def set_bad(self): 
+        with self._lock_connections: 
+            if self.kid == 0: 
+                return 
+            if self.not_to_erase: 
+                self.to_be_erased = True     
+                return
+
+            # update covisibility graph 
+            for kf_connected in list(self.connected_keyframes_weights.keys()):          
+                kf_connected.erase_connection(self)    
                 
+            for idx,p in enumerate(self.points): 
+                if p is not None: 
+                    p.remove_observation(self,idx)
+                                 
+            self.reset_covisibility()
+            
+            # update spanning tree: each children must be connected to a new parent 
+            # build a set of parent candidates for the children 
+            parent_candidates = set() 
+            assert(self.parent is not None)
+            parent_candidates.add(self.parent)
+            
+            # each child must be connected to a new parent (the candidate parent with highest covisibility weight)
+            # once a child is connected to a new parent, include the child as new parent candidate for the rest            
+            while not len(self.children)==0:            
+                w_max = 0
+                child_to_connect = None 
+                parent_to_connect = None 
+                found_connection = False 
+                for kf_child in self.children: 
+                    if kf_child.is_bad:
+                        continue
+                    # check if a candidate parent is connected to kf_child and compute the candidate parent with highest covisibility weight                     
+                    covisible_keyframes = kf_child.get_covisible_keyframes()
+                    for candidate_parent in parent_candidates: 
+                        if candidate_parent in covisible_keyframes:
+                            w = kf_child.get_weight(candidate_parent)
+                            if w > w_max: 
+                                w_max = w 
+                                child_to_connect = kf_child
+                                parent_to_connect = candidate_parent 
+                                found_connection = True 
+                if found_connection: 
+                    child_to_connect.set_parent(parent_to_connect)
+                    parent_candidates.add(child_to_connect)
+                    self.children.remove(child_to_connect)
+                else: 
+                    break # stop since there is no connection with covisibility weight>0
+
+            # if a child has no covisibility connections with any parent candidate, connect it with the original parent of this keyframe
+            if not len(self.children)==0:
+                for kf_child in self.children:  
+                    kf_child.set_parent(self.parent)
+                    
+            self.parent.erase_child(self)
+            self._pose_Tcp.update(self.Tcw @ self.parent.Twc)
+            self._is_bad = True 
+            
+        if self.map is not None:
+            self.map.remove_keyframe(self)
 
 
 def match_frames(f1, f2, ratio_test=None):
@@ -744,3 +844,4 @@ def match_frames(f1, f2, ratio_test=None):
     idx1 = np.asarray(idx1)
     idx2 = np.asarray(idx2)
     return idx1, idx2
+

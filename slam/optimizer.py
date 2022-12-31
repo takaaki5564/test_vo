@@ -14,7 +14,6 @@ def bundle_adjustment(keyframes, points, local_window, fixed_points=False, verbo
     pass
 
 
-
 # optimize points reprojection error:
 # - frame pose is optimized
 # - 3D points observed in frame are considered fixed

@@ -14,6 +14,9 @@ from slam.frame import *
 from slam.frame import *
 
 import g2o
+#import slam.optimizer_g2o 
+
+from slam import optimizer_g2o
 from slam import optimizer
 
 
@@ -66,6 +69,7 @@ class Map:
             return len(self.keyframes)  
 
     def add_keyframe(self, keyframe):
+        print("###added keyframe ####################")
         with self._lock:
             assert(keyframe.is_keyframe)
             ret = self.max_keyframe_id
@@ -281,14 +285,12 @@ class Map:
 
 
     # local BA: only local keyframes and local points are adjusted
-    def locally_optimize(self, kf_ref, verbose = False, rounds=10, abort_flag=False):
+    def locally_optimize(self, kf_ref, verbose = False, rounds=10):
         keyframes, points, ref_keyframes = self.local_map.update(kf_ref)
         print('####[locally_optimize] local optimization window: ', sorted([kf.id for kf in keyframes]))        
         print('                     refs: ', sorted([kf.id for kf in ref_keyframes]))
-        print('                   #points: ', len(points))               
-        #print('                   points: ', sorted([p.id for p in points]))        
-        #err = optimizer_g2o.optimize(frames, points, None, False, verbose, rounds)  
-        err, ratio_bad_observations = optimizer_g2o.local_bundle_adjustment(keyframes, points, ref_keyframes, False, verbose, rounds, abort_flag=abort_flag, map_lock=self.update_lock)
+        print('                   #points: ', len(points))
+        err, ratio_bad_observations = optimizer_g2o.local_bundle_adjustment(keyframes, points, ref_keyframes, False, verbose, rounds, map_lock=self.update_lock)
         print('####[locally_optimize] local optimization - perc bad observations: %.2f %%' % (ratio_bad_observations*100) )              
         return err 
 
@@ -380,15 +382,11 @@ class MapPoint:
 
     def add_observation(self, keyframe, idx):
         assert(keyframe.is_keyframe)
-        #print(">>> add_observation")
         with self._lock_features:
             if keyframe not in self._observations:
-                #print("### call set_point_match idx={}".format(idx))
                 keyframe.set_point_match(self, idx)
                 self._observations[keyframe] = idx
                 self._num_observations += 1
-            # else:
-            #     print("### set_point_match idx={} skip, no observation".format(idx))
 
     def remove_observation(self, keyframe, idx=None):
         pass         
@@ -549,6 +547,75 @@ class MapPoint:
                 self.des = descriptors[np.argmin(median_distances)].copy()
 
 
+    # replace this point with map point p 
+    def replace_with(self, p):         
+        if p.id == self.id: 
+            return 
+        observations, num_times_visible, num_times_found = None, 0, 0 
+        with self._lock_features:
+            with self._lock_pos:   
+                observations = list(self._observations.items()) 
+                self._observations.clear()     
+                num_times_visible = self.num_times_visible
+                num_times_found = self.num_times_found      
+                self._is_bad = True  
+                self._num_observations = 0  
+                self.replacement = p                 
+            
+        # replace point observations in keyframes
+        for kf, kidx in observations: # we have kf.get_point_match(kidx) = self 
+            if p.add_observation(kf,kidx): 
+                kf.replace_point_match(p,kidx)                  
+            else:                
+                kf.remove_point_match(kidx)
+
+        p.increase_visible(num_times_visible)
+        p.increase_found(num_times_found)        
+        p.update_best_descriptor(force=True)    
+                     
+        self.map.remove_point(self)     
+
+
+    def update_normal_and_depth(self, frame=None, idxf=None,force=False):
+        skip = False  
+        with self._lock_features:
+            with self._lock_pos:   
+                if self._is_bad:
+                    return                 
+                if self._num_observations > self.num_observations_on_last_update_normals or force:   # implicit if self._num_observations > 1          
+                    self.num_observations_on_last_update_normals = self._num_observations 
+                    observations = list(self._observations.items())
+                    kf_ref = self.kf_ref 
+                    idx_ref = self._observations[kf_ref]
+                    position = self._pt.copy() 
+                else: 
+                    skip = True 
+        if skip or len(observations)==0:
+            return 
+                     
+        normals = np.array([normalize_vector2(position-kf.Ow) for kf,idx in observations])
+        normal = normalize_vector2(np.mean(normals,axis=0))
+  
+        level = kf_ref.octaves[idx_ref]
+        level_scale_factor = Frame.tracker.scale_factors[level]
+        dist = np.linalg.norm(position-kf_ref.Ow)
+        
+        with self._lock_pos:
+            self._max_distance = dist * level_scale_factor
+            self._min_distance = self._max_distance / Frame.tracker.scale_factors[Frame.tracker.num_levels-1]            
+            self.normal = normal
+
+    def delete(self):                
+        with self._lock_features:
+            with self._lock_pos:
+                self._is_bad = True 
+                self._num_observations = 0                   
+                observations = list(self._observations.items()) 
+                self._observations.clear()        
+        for kf,idx in observations:
+            kf.remove_point_match(idx)         
+        del self  # delete if self is the last reference 
+
 
 # Local map base class 
 class LocalMapBase(object):
@@ -654,7 +721,7 @@ class LocalCovisibilityMap(LocalMapBase):
             self.keyframes.update(neighbor_kfs)
             return self.keyframes
         
-    def get_best_neighbors(self, kf_ref, N=20): 
+    def get_best_neighbors(self, kf_ref, N=10): 
         return kf_ref.get_best_covisible_keyframes(N)               
     
     # update the local keyframes, the viewed points and the reference keyframes (that see the viewed points but are not in the local keyframes)

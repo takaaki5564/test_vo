@@ -20,10 +20,6 @@ from slam.frame import * #Frame, KeyFrame
 from slam.feature import * #DescriptorFeatureTracker
 from slam.tracking import * #Tracking
 
-#import logging
-#logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)7s %(message)s")
-#log = logging.getLogger(__name__)
-
 import OpenGL.GL as gl
 import pangolin
 
@@ -31,22 +27,20 @@ import pangolin
 def main():
 
     videopath = "/home/spiral/work/pyslam/videos/kitti00/video.mp4"
-    #videopath = "/home/spiral/work/dataset/spiral_inside1.mp4"
-    #videopath = 0 # camera id
 
     skip_frame = 240
     dataset = LoadDataset(videopath, skip_frame)
 
     # Read intrinsic parameters
-    K = np.load("./logicool720p/mtx.npy")
-    D = np.load("./logicool720p/dist.npy")
+    K = np.load("./camera_matrix/kitti/mtx.npy")
+    D = np.load("./camera_matrix/kitti/dist.npy")
 
     # Camera info
     w = dataset.width
     h = dataset.height
     fps = dataset.fps
     cam = PinholeCamera(w, h, K, D, fps)
-    print("# [main] >>> Initialized Camera")
+    print("# [main] >>> Initialized Camera K= {}, D= {}".format(K, D))
 
     # FAST detector / ORB descriptor / BF tracker
     num_features = 2000
@@ -74,7 +68,8 @@ def main():
     img_id = 0
     while True:
         img = dataset.getImage(img_id)
-        img = cv2.resize(img, dsize=(int(w/2), int(h/2)))
+        #img = cv2.resize(img, dsize=(int(w/2), int(h/2)))
+        print("# [main] cap img h= {} w= {}".format(img.shape[0], img.shape[1]))
 
         if img is not None:
             slam.track(img, img_id)
@@ -98,7 +93,7 @@ def main():
                 cv2.imshow('Trajectory', traj_img)
                 print("# [main] Traj: x=%2fm y=%2fm z=%2fm" % (x, y, z))
 
-        ley = cv2.waitKey(100)
+        ley = cv2.waitKey(10)
         if  0xFF == ord('q'):
             if viewer3D is not None:
                 viewer3D.quit()

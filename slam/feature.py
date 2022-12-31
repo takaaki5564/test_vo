@@ -18,10 +18,6 @@ from slam.utils import *
 from slam.map import *
 from slam.frame import *
 
-#import logging
-#logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)7s %(message)s")
-#log = logging.getLogger(__name__)
-
 import OpenGL.GL as gl
 import pangolin
 
@@ -41,24 +37,6 @@ class FeatureTrackingResult(object):
         self.idxs_cur = None         # indexes of matches in kps_cur so that kps_cur_matched = kps_cur[idxs_cur]  (numpy array of indexes)
         self.kps_ref_matched = None  # reference matched keypoints, kps_ref_matched = kps_ref[idxs_ref]
         self.kps_cur_matched = None  # current matched keypoints, kps_cur_matched = kps_cur[idxs_cur]
-
-
-
-# class FeatureDetector:
-#     def __init__(self, num_features, quality_level = 0.01, min_corner_distance = 3):
-#         self.num_features = num_features
-#         self.quality_level = quality_level
-#         self.min_corner_distance = min_corner_distance
-#         self.blockSize = 5
-    
-#     def detect(self, frame, mask=None):
-#         pts = cv2.goodFeaturesToTrack(frame, self.num_features, self.quality_level, self.min_corner_distance, blockSize=self.blockSize, mask=mask)
-#         if pts is not None:
-#             kps = [cv2.KeyPoint(p[0][0], p[0][1], self.blockSize) for p in pts]
-#         else:
-#             kps = []
-#         return kps
-
 
 
 class FeatureMatcherTypes(Enum):
@@ -111,7 +89,6 @@ class BfFeatureMatcher:
 class DescriptorFeatureTracker:
     def __init__(self, num_features, num_levels = 3, scale_factor = 1.2):
         # detector & descriptor type = ORB
-        self.min_features = 50
         self.num_features = num_features
         self.sigma_level0 = 1.0
         self.num_levels = num_levels
@@ -158,7 +135,7 @@ class DescriptorFeatureTracker:
     def init_sigma_levels(self):
         kNumLevelsInitSigma = 40
         kSigmaLevel0 = 1.0
-        print("num levels: ", self.num_levels)
+        print("#### [init_sigma_levels] num levels: ", self.num_levels)
         num_levels = max(kNumLevelsInitSigma, self.num_levels)
         self.inv_scale_factor = 1./self.scale_factor
         self.scale_factors = np.zeros(num_levels)
@@ -180,7 +157,6 @@ class DescriptorFeatureTracker:
             self.inv_scale_factors[i] = 1.0 / self.scale_factors[i]
             self.inv_level_sigmas2[i] = 1.0 / self.level_sigmas2[i]
 
-    
     def detectAndCompute(self, frame, mask=None, filter=True):
         if frame.ndim > 2:
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
@@ -188,7 +164,6 @@ class DescriptorFeatureTracker:
         #print("####[detectAndCompute] des= {}".format(des))
         return kps, des
 
-    
     def pyramid_compute(self, frame):
         inv_scale = 1./self.scale_factor
         self.imgs = []
@@ -204,63 +179,6 @@ class DescriptorFeatureTracker:
     def track(self, image_ref, image_cur, kps_ref):
         kps_cur, des_cur = self.detectAndCompute(image_cur)
         kps_cur = np.array([x.pt for x in kps_cur], dtype=np.float32)
-
-
-
-class TrackingHistory():
-    def __init__(self):
-        self.relative_frame_poses = []  # list of relative frame poses as g2o.Isometry3d() (see camera_pose.py)
-        self.kf_references = []         # list of reference keyframes  
-        self.timestamps = []            # list of frame timestamps 
-        self.slam_states = []           # list of slam states 
-
-
-
-class MotionModel():
-    def __init__(self):
-        initial_position = None
-        initial_orientation = None
-        initial_covariance = None
-
-        self.is_ok = False
-        self.initialized = False
-
-        self.delta_position = np.zeros(3)
-        self.delta_orientation = g2o.Quaternion()
-    
-    def current_pose(self):
-        return (g2o.Isometry3d(self.orientation, self.position), self.covariance)
-    
-    def predict_pose(self, prev_position=None, prev_orientation=None):
-        # Predict next camera pose
-        if prev_position is not None:
-            self.position = prev_position
-        if prev_orientation is not None:
-            self.orientation = prev_orientation
-        
-        if not self.initialized:
-            return (g2o.Isometry3d(self.orientation, self.position), self.covariance)
-        
-        orientation = self.delta_orientation * self.orientation
-        position = self.position + self.delta_orientation * self.delta_position
-
-        return (g2o.Isometry3d(orientation, position), self.covariance)
-    
-    def update_pose(self, new_position, new_orientation, new_covariance=None):
-        if initialized:
-            self.delta_position = new_position - self.position
-            self.delta_orientation = new_orientation * self.orientation.inverse()
-            self.delta_orientation.normalize()
-        self.position = new_position
-        self.orientation = new_orientation
-        self.covariane = new_covariance
-        self.initialized = True
-
-class SLAMDynamicConfig:
-    def __init__(self):
-        self.descriptor_distance_sigma = None
-
-
 
 class RotationHistogram:
     def __init__(self, histogram_length = 30):
@@ -285,7 +203,47 @@ class RotationHistogram:
             if (s > max1):
                 max3 = max2
                 
-    
     def get_invalid_idxs(self):
         ind1, ind2, ind3 = self.compute_3_max()
+
+
+# class MotionModel():
+#     def __init__(self):
+#         initial_position = None
+#         initial_orientation = None
+#         initial_covariance = None
+
+#         self.is_ok = False
+#         self.initialized = False
+
+#         self.delta_position = np.zeros(3)
+#         self.delta_orientation = g2o.Quaternion()
+    
+#     def current_pose(self):
+#         return (g2o.Isometry3d(self.orientation, self.position), self.covariance)
+    
+#     def predict_pose(self, prev_position=None, prev_orientation=None):
+#         # Predict next camera pose
+#         if prev_position is not None:
+#             self.position = prev_position
+#         if prev_orientation is not None:
+#             self.orientation = prev_orientation
+        
+#         if not self.initialized:
+#             return (g2o.Isometry3d(self.orientation, self.position), self.covariance)
+        
+#         orientation = self.delta_orientation * self.orientation
+#         position = self.position + self.delta_orientation * self.delta_position
+
+#         return (g2o.Isometry3d(orientation, position), self.covariance)
+    
+#     def update_pose(self, new_position, new_orientation, new_covariance=None):
+#         if initialized:
+#             self.delta_position = new_position - self.position
+#             self.delta_orientation = new_orientation * self.orientation.inverse()
+#             self.delta_orientation.normalize()
+#         self.position = new_position
+#         self.orientation = new_orientation
+#         self.covariane = new_covariance
+#         self.initialized = True
 
